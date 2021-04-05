@@ -4,7 +4,8 @@ mod parse;
 
 use derive_more::*;
 use derive_try_from_primitive::TryFromPrimitive;
-use std::{convert::TryFrom, fmt};
+use enumflags2::*;
+use std::{convert::TryFrom, fmt, ops::Range};
 
 /// Fields parsed from a 64-bit, little-endian ELF file.
 #[derive(Debug)]
@@ -12,6 +13,7 @@ pub struct File {
     pub typ: Type,
     pub machine: Machine,
     pub entry_point: Addr,
+    pub program_headers: Vec<ProgramHeader>,
 }
 
 impl File {
@@ -23,11 +25,13 @@ impl File {
     fn try_parse_from(i: parse::Input) -> parse::Result<Self> {
         use nom::{
             bytes::complete::{tag, take},
-            combinator::verify,
+            combinator::{map, verify},
             error::context,
-            number::complete::le_u32,
+            number::complete::{le_u16, le_u32},
             sequence::tuple,
         };
+
+        let full_input = i;
 
         let (i, _) = tuple((
             // --------
@@ -48,12 +52,33 @@ impl File {
 
         let (i, entry_point) = Addr::parse(i)?;
 
+        // Some values are stored as u16's in the ELF file to save storage, but
+        // they're actually file offsets or counts. So, in Rust, we want to store
+        // them as `usize`.
+        let u16_usize = map(le_u16, |x| x as usize);
+
+        // ph == program header.
+        // sh == section header.
+        let (i, (ph_offset, sh_offset)) = tuple((Addr::parse, Addr::parse))(i)?;
+        let (i, (flags, hdr_size)) = tuple((le_u32, le_u16))(i)?;
+        let (i, (ph_entsize, ph_count)) = tuple((&u16_usize, &u16_usize))(i)?;
+        let (i, (sh_entsize, sh_count, sh_nidx)) = tuple((&u16_usize, &u16_usize, &u16_usize))(i)?;
+
+        let ph_slices = (&full_input[ph_offset.into()..]).chunks(ph_entsize);
+        let mut program_headers = Vec::with_capacity(ph_count);
+
+        for ph_slice in ph_slices.take(ph_count) {
+            let (_, ph) = ProgramHeader::parse(full_input, ph_slice)?;
+            program_headers.push(ph);
+        }
+
         Ok((
             i,
             Self {
                 typ,
                 machine,
                 entry_point,
+                program_headers,
             },
         ))
     }
@@ -94,6 +119,115 @@ pub enum Machine {
 }
 
 impl_parse_for_enum!(Machine, le_u16);
+
+/// The type of a program memory segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
+#[repr(u32)]
+pub enum SegmentType {
+    Null = 0x0,
+    Load = 0x1,
+    Dynamic = 0x2,
+    Interp = 0x3,
+    Note = 0x4,
+}
+
+impl_parse_for_enum!(SegmentType, le_u32);
+
+/// The permissions set on a program memory segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BitFlags)]
+#[repr(u32)]
+pub enum SegmentFlag {
+    Execute = 0x1,
+    Write = 0x2,
+    Read = 0x4,
+}
+
+impl_parse_for_enumflags!(SegmentFlag, le_u32);
+
+/// An ELF program header. A program can have many of these headers.
+pub struct ProgramHeader {
+    pub typ: SegmentType,
+    pub flags: BitFlags<SegmentFlag>,
+    pub offset: Addr,
+    pub vaddr: Addr,
+    pub paddr: Addr,
+    pub filesz: Addr,
+    pub memsz: Addr,
+    pub align: Addr,
+    pub data: Vec<u8>,
+}
+
+impl ProgramHeader {
+    /// Range where the segment is stored in the file.
+    pub fn file_range(&self) -> Range<Addr> {
+        self.offset..self.offset + self.filesz
+    }
+
+    /// Memory range where the segment is mapped.
+    pub fn mem_range(&self) -> Range<Addr> {
+        self.vaddr..self.vaddr + self.memsz
+    }
+
+    fn parse<'a>(full_input: parse::Input<'_>, i: parse::Input<'a>) -> parse::Result<'a, Self> {
+        use nom::sequence::tuple;
+
+        let (i, (typ, flags)) = tuple((SegmentType::parse, SegmentFlag::parse))(i)?;
+
+        let (i, (offset, vaddr, paddr, filesz, memsz, align)) = tuple((
+            Addr::parse,
+            Addr::parse,
+            Addr::parse,
+            Addr::parse,
+            Addr::parse,
+            Addr::parse,
+        ))(i)?;
+
+        Ok((
+            i,
+            Self {
+                typ,
+                flags,
+                offset,
+                vaddr,
+                paddr,
+                filesz,
+                memsz,
+                align,
+                // `to_vec()` turns a slice into an owned Vec (which works because
+                // u8 is Clone + Copy).
+                data: full_input[offset.into()..][..filesz.into()].to_vec(),
+            },
+        ))
+    }
+}
+
+impl fmt::Debug for ProgramHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "file {:?} | mem {:?} | align {:?} | {} {:?}",
+            self.file_range(),
+            self.mem_range(),
+            self.align,
+            &[
+                (SegmentFlag::Read, "R"),
+                (SegmentFlag::Write, "W"),
+                (SegmentFlag::Execute, "X"),
+            ]
+            .iter()
+            .map(|&(flag, letter)| {
+                if self.flags.contains(flag) {
+                    letter
+                } else {
+                    "."
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+            self.typ,
+        )
+    }
+}
 
 /// Wraps a `u64` memory address, and adds some nice, automatic `Display` and
 /// `Debug` formats. Also adds a nice method for parsing `u64` memory addresses
@@ -205,5 +339,16 @@ mod tests {
         assert_eq!(Machine::X86_64 as u16, 0x3E);
         assert_eq!(Machine::try_from(0x3E), Ok(Machine::X86_64));
         assert_eq!(Machine::try_from(0xFA), Err(0xFA));
+    }
+
+    #[test]
+    fn try_bitflags() {
+        let flags_integer = 6_u32;
+
+        let flags = BitFlags::<SegmentFlag>::from_bits(flags_integer).unwrap();
+        assert_eq!(flags, SegmentFlag::Read | SegmentFlag::Write);
+        assert_eq!(flags.bits(), flags_integer);
+
+        assert!(BitFlags::<SegmentFlag>::from_bits(1992).is_err());
     }
 }

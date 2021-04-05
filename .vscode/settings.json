@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "*.m": "matlab",
+        "*.lds": "linkerscript",
+        "errno.h": "c",
+        "mman.h": "c"
+    }
+}

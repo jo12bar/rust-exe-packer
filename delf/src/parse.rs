@@ -52,3 +52,35 @@ macro_rules! impl_parse_for_enum {
         }
     };
 }
+
+/// Like [`impl_parse_for_enum`], but for enums that use the `enumflags2` `BitFlags`
+/// proc macro.
+#[macro_export]
+macro_rules! impl_parse_for_enumflags {
+    ($type: ident, $number_parser: ident) => {
+        impl $type {
+            doc_comment::doc_comment! {
+                concat!(
+                    "Parse a bitflag-built number into a [`",
+                    stringify!($type),
+                    "`] using [`nom::number::complete::",
+                    stringify!($number_parser),
+                    "`].",
+                ),
+                pub fn parse(i: $crate::parse::Input) -> $crate::parse::Result<enumflags2::BitFlags<Self>> {
+                    use nom::{
+                        combinator::map_res,
+                        error::{context, ErrorKind},
+                        number::complete::$number_parser,
+                    };
+
+                    let parser = map_res($number_parser, |x| {
+                        enumflags2::BitFlags::<Self>::from_bits(x).map_err(|_| ErrorKind::Alt)
+                    });
+
+                    context(stringify!($type), parser)(i)
+                }
+            }
+        }
+    }
+}
