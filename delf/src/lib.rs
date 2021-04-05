@@ -59,10 +59,11 @@ impl File {
 
         // ph == program header.
         // sh == section header.
-        let (i, (ph_offset, sh_offset)) = tuple((Addr::parse, Addr::parse))(i)?;
-        let (i, (flags, hdr_size)) = tuple((le_u32, le_u16))(i)?;
+        let (i, (ph_offset, _sh_offset)) = tuple((Addr::parse, Addr::parse))(i)?;
+        let (i, (_flags, _hdr_size)) = tuple((le_u32, le_u16))(i)?;
         let (i, (ph_entsize, ph_count)) = tuple((&u16_usize, &u16_usize))(i)?;
-        let (i, (sh_entsize, sh_count, sh_nidx)) = tuple((&u16_usize, &u16_usize, &u16_usize))(i)?;
+        let (i, (_sh_entsize, _sh_count, _sh_nidx)) =
+            tuple((&u16_usize, &u16_usize, &u16_usize))(i)?;
 
         let ph_slices = (&full_input[ph_offset.into()..]).chunks(ph_entsize);
         let mut program_headers = Vec::with_capacity(ph_count);
@@ -123,12 +124,24 @@ impl_parse_for_enum!(Machine, le_u16);
 /// The type of a program memory segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
 #[repr(u32)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum SegmentType {
     Null = 0x0,
     Load = 0x1,
     Dynamic = 0x2,
     Interp = 0x3,
     Note = 0x4,
+    ShLib = 0x5,
+    PHdr = 0x6,
+    TLS = 0x7,
+    LoOS = 0x6000_0000,
+    HiOS = 0x6FFF_FFFF,
+    LoProc = 0x7000_0000,
+    HiProc = 0x7FFF_FFFF,
+    GnuEhFrame = 0x6474_E550,
+    GnuStack = 0x6474_E551,
+    GnuRelRo = 0x6474_E552,
+    GnuProperty = 0x6474_E553,
 }
 
 impl_parse_for_enum!(SegmentType, le_u32);
