@@ -96,6 +96,58 @@ impl File {
             Err(_) => panic!("Unexpected nom error"),
         }
     }
+
+    /// Get the ELF file segment associated with an address, or `None` if there
+    /// isn't a segment like that anywhere.
+    pub fn segment_at(&self, addr: Addr) -> Option<&ProgramHeader> {
+        self.program_headers
+            .iter()
+            .filter(|ph| ph.typ == SegmentType::Load)
+            .find(|ph| ph.mem_range().contains(&addr))
+    }
+
+    /// Gets the first ELF segment matching a [`SegmentType`].
+    pub fn segment_of_type(&self, typ: SegmentType) -> Option<&ProgramHeader> {
+        self.program_headers.iter().find(|ph| ph.typ == typ)
+    }
+
+    /// Get the address to a dynamic entry with some [`DynamicTag`].
+    pub fn dynamic_entry(&self, tag: DynamicTag) -> Option<Addr> {
+        match self.segment_of_type(SegmentType::Dynamic) {
+            Some(ProgramHeader {
+                contents: SegmentContents::Dynamic(entries),
+                ..
+            }) => entries.iter().find(|e| e.tag == tag).map(|e| e.addr),
+            _ => None,
+        }
+    }
+
+    /// Read all [`Rela`] entries in the ELF file.
+    pub fn read_rela_entries(&self) -> Result<Vec<Rela>, ReadRelaError> {
+        use nom::multi::many0;
+        use DynamicTag as DT;
+        use ReadRelaError as E;
+
+        // Converting `Option<T>` to `Result<T, E>` so we can use `?` to bubble
+        // up errors:
+        let addr = self.dynamic_entry(DT::Rela).ok_or(E::RelaNotFound)?;
+        let len = self.dynamic_entry(DT::RelaSz).ok_or(E::RelaSzNotFound)?;
+        let seg = self.segment_at(addr).ok_or(E::RelaSegmentNotFound)?;
+
+        // double-slicing trick:
+        let i = &seg.data[(addr - seg.mem_range().start).into()..][..len.into()];
+
+        match many0(Rela::parse)(i) {
+            Ok((_, rela_entries)) => Ok(rela_entries),
+            Err(nom::Err::Failure(err)) | Err(nom::Err::Error(err)) => {
+                let e = &err.errors[0];
+                let (_input, error_kind) = e;
+                Err(E::ParsingError(error_kind.clone()))
+            }
+            // we don't use any "streaming" parsers so `nom::Err::Incomplete` shouldn't happen
+            Err(nom::Err::Incomplete(..)) => unreachable!(),
+        }
+    }
 }
 
 /// The type of parsed ELF file.
@@ -168,6 +220,7 @@ pub struct ProgramHeader {
     pub memsz: Addr,
     pub align: Addr,
     pub data: Vec<u8>,
+    pub contents: SegmentContents,
 }
 
 impl ProgramHeader {
@@ -181,8 +234,12 @@ impl ProgramHeader {
         self.vaddr..self.vaddr + self.memsz
     }
 
-    fn parse<'a>(full_input: parse::Input<'_>, i: parse::Input<'a>) -> parse::Result<'a, Self> {
-        use nom::sequence::tuple;
+    fn parse<'a>(full_input: parse::Input<'a>, i: parse::Input<'a>) -> parse::Result<'a, Self> {
+        use nom::{
+            combinator::{map, verify},
+            multi::many_till,
+            sequence::tuple,
+        };
 
         let (i, (typ, flags)) = tuple((SegmentType::parse, SegmentFlag::parse))(i)?;
 
@@ -195,6 +252,19 @@ impl ProgramHeader {
             Addr::parse,
         ))(i)?;
 
+        let slice = &full_input[offset.into()..][..filesz.into()];
+        let (_, contents) = match typ {
+            SegmentType::Dynamic => map(
+                many_till(
+                    DynamicEntry::parse,
+                    verify(DynamicEntry::parse, |e| e.tag == DynamicTag::Null),
+                ),
+                |(entries, _last)| SegmentContents::Dynamic(entries),
+            )(slice)?,
+
+            _ => (slice, SegmentContents::Unknown),
+        };
+
         Ok((
             i,
             Self {
@@ -206,9 +276,8 @@ impl ProgramHeader {
                 filesz,
                 memsz,
                 align,
-                // `to_vec()` turns a slice into an owned Vec (which works because
-                // u8 is Clone + Copy).
-                data: full_input[offset.into()..][..filesz.into()].to_vec(),
+                data: slice.to_vec(),
+                contents,
             },
         ))
     }
@@ -241,6 +310,187 @@ impl fmt::Debug for ProgramHeader {
         )
     }
 }
+
+/// The contents of an ELF segment.
+pub enum SegmentContents {
+    Dynamic(Vec<DynamicEntry>),
+    Unknown,
+}
+
+/// A `Dynamic` segment entry.
+#[derive(Debug)]
+pub struct DynamicEntry {
+    pub tag: DynamicTag,
+    pub addr: Addr,
+}
+
+impl DynamicEntry {
+    fn parse(i: parse::Input) -> parse::Result<Self> {
+        use nom::sequence::tuple;
+
+        let (i, (tag, addr)) = tuple((DynamicTag::parse, Addr::parse))(i)?;
+        Ok((i, Self { tag, addr }))
+    }
+}
+
+/// A tag for a [`DynamicEntry`].
+#[derive(Debug, TryFromPrimitive, PartialEq, Eq)]
+#[repr(u64)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum DynamicTag {
+    Null = 0,
+    Needed = 1,
+    PltRelSz = 2,
+    PltGot = 3,
+    Hash = 4,
+    StrTab = 5,
+    SymTab = 6,
+    Rela = 7,
+    RelaSz = 8,
+    RelaEnt = 9,
+    StrSz = 10,
+    SymEnt = 11,
+    Init = 12,
+    Fini = 13,
+    SoName = 14,
+    RPath = 15,
+    Symbolic = 16,
+    Rel = 17,
+    RelSz = 18,
+    RelEnt = 19,
+    PltRel = 20,
+    Debug = 21,
+    TextRel = 22,
+    JmpRel = 23,
+    BindNow = 24,
+    InitArray = 25,
+    FiniArray = 26,
+    InitArraySz = 27,
+    FiniArraySz = 28,
+    Flags = 0x1e,
+    LoOs = 0x60000000,
+    LoProc = 0x70000000,
+    HiProc = 0x7fffffff,
+    GnuHash = 0x6ffffef5,
+    VerSym = 0x6ffffff0,
+    RelaCount = 0x6ffffff9,
+    Flags1 = 0x6ffffffb,
+    VerDef = 0x6ffffffc,
+    VerDefNum = 0x6ffffffd,
+    VerNeed = 0x6ffffffe,
+    VerNeedNum = 0x6fffffff,
+}
+
+impl_parse_for_enum!(DynamicTag, le_u64);
+
+/// An ELF relocation descriptor.
+#[derive(Debug)]
+pub struct Rela {
+    /// Address of reference
+    pub offset: Addr,
+    /// Relocation type
+    pub typ: RelType,
+    /// Symbol type
+    pub sym: u32,
+    /// Constant part of expression
+    pub addend: Addr,
+}
+
+impl Rela {
+    pub fn parse(i: parse::Input) -> parse::Result<Self> {
+        use nom::{combinator::map, number::complete::le_u32, sequence::tuple};
+
+        map(
+            tuple((Addr::parse, RelType::parse, le_u32, Addr::parse)),
+            |(offset, typ, sym, addend)| Self {
+                offset,
+                typ,
+                sym,
+                addend,
+            },
+        )(i)
+    }
+}
+
+/// The possible relocation types.
+///
+/// ## Calculations
+///
+/// - __`A`__ represents the addend used to compute the value of the relocatable field.
+/// - __`B`__ represents the base address at which a shared object has been loaded
+///   into memory during execution.
+/// - __`G`__ represents the offset into the global offset table at which the
+///   relocation entry's symbol will reside during execution.
+/// - __`GOT`__ represents the address of the global offset table.
+/// - __`L`__ represents the place (section offset or address) of the Procedure
+///   Linkage Table entry for a symbol.
+/// - __`P`__ represents the place (section offset or address) of the storage
+///   unit being relocated.
+/// - __`S`__ represents the value of the symbol whose index resides in the
+///   relocation entry.
+/// - __`Z`__ represents the size of the symbol whose index resides in the
+///   relocation entry.
+#[derive(Debug, TryFromPrimitive, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RelType {
+    /// Calculation: none
+    None = 0,
+    /// Calculation: `S + A`
+    R64 = 1,
+    /// Calculation: `S + A - P`
+    Pc32 = 2,
+    /// Calculation: `G + A`
+    Got32 = 3,
+    /// Calculation: `L + A - P`
+    Plt32 = 4,
+    /// Calculation: none
+    Copy = 5,
+    /// Calculation: `S`
+    GlobDat = 6,
+    /// Calculation: `S`
+    JumpSlot = 7,
+    /// Calculation: `B + A`
+    Relative = 8,
+    /// Calculation: `G + GOT + A - P`
+    GotPcRel = 9,
+    /// Calculation: `S + A`
+    R32 = 10,
+    /// Calculation: `S + A`
+    R32S = 11,
+    /// Calculation: `S + A`
+    R16 = 12,
+    /// Calculation: `S + A - P`
+    Pc16 = 13,
+    /// Calculation: `S + A`
+    R8 = 14,
+    /// Calculation: `S + A - P`
+    Pc8 = 15,
+    DtpMod64 = 16,
+    DtpOff64 = 17,
+    TpOff64 = 18,
+    TlsGd = 19,
+    TlsLd = 20,
+    DtpOff32 = 21,
+    GotTpOff = 22,
+    TpOff32 = 23,
+    /// Calculation: `S + A - P`
+    Pc64 = 24,
+    /// Calculation: `S + A - GOT`
+    GotOff64 = 25,
+    /// Calculation: `GOT + A - GOT`
+    GotPc32 = 26,
+    /// Calculation: `Z + A`
+    Size32 = 32,
+    /// Calculation: `Z + A`
+    Size64 = 33,
+    GotPc32TlsDesc = 34,
+    TlsDescCall = 35,
+    TlsDesc = 36,
+    /// Calculation: `indirect (B + A)`
+    IRelative = 37,
+}
+
+impl_parse_for_enum!(RelType, le_u32);
 
 /// Wraps a `u64` memory address, and adds some nice, automatic `Display` and
 /// `Debug` formats. Also adds a nice method for parsing `u64` memory addresses
@@ -337,6 +587,19 @@ impl fmt::Display for FileParseError {
 }
 
 impl std::error::Error for FileParseError {}
+
+/// Errors that may occur when reading an ELF `Rela`.
+#[derive(thiserror::Error, Debug)]
+pub enum ReadRelaError {
+    #[error("Rela dynamic entry not found")]
+    RelaNotFound,
+    #[error("RelaSz dynamic entry not found")]
+    RelaSzNotFound,
+    #[error("Rela segment not found")]
+    RelaSegmentNotFound,
+    #[error("Parsing error")]
+    ParsingError(nom::error::VerboseErrorKind),
+}
 
 #[cfg(test)]
 mod tests {

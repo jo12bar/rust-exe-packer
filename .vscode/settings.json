@@ -1,8 +1,9 @@
 {
-    "files.associations": {
-        "*.m": "matlab",
-        "*.lds": "linkerscript",
-        "errno.h": "c",
-        "mman.h": "c"
-    }
+  "files.associations": {
+    "*.m": "matlab",
+    "*.lds": "linkerscript",
+    "errno.h": "c",
+    "mman.h": "c"
+  },
+  "rust-analyzer.procMacro.enable": true
 }
