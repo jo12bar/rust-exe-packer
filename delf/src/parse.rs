@@ -1,11 +1,7 @@
 //! Utilities for parsing little-endian, 64-bit ELF files via [`nom`].
 
-/// We expect to recieve a buffer of bytes as our input to our parsers.
-pub type Input<'a> = &'a [u8];
-
-/// We want to make `nom` output verbose errors whenever possible. So, for
-/// convenience, we define our own result type. `O` is the parsed output type.
-pub type Result<'a, O> = nom::IResult<Input<'a>, O, nom::error::VerboseError<Input<'a>>>;
+use nom::{ErrorConvert, Slice};
+use std::ops::RangeFrom;
 
 /// Implements a parse method for an enum, allowing you to parse some number
 /// value into an enum type.
@@ -84,3 +80,60 @@ macro_rules! impl_parse_for_enumflags {
         }
     }
 }
+
+/// The type of parsing error.
+#[derive(Debug, Clone)]
+pub enum ErrorKind {
+    Nom(nom::error::ErrorKind),
+    Context(&'static str),
+}
+
+/// A parsing error.
+pub struct Error<I> {
+    pub errors: Vec<(I, ErrorKind)>,
+}
+
+impl<I> nom::error::ParseError<I> for Error<I> {
+    fn from_error_kind(input: I, kind: nom::error::ErrorKind) -> Self {
+        let errors = vec![(input, ErrorKind::Nom(kind))];
+        Self { errors }
+    }
+
+    fn append(input: I, kind: nom::error::ErrorKind, mut other: Self) -> Self {
+        other.errors.push((input, ErrorKind::Nom(kind)));
+        other
+    }
+
+    fn add_context(input: I, ctx: &'static str, mut other: Self) -> Self {
+        other.errors.push((input, ErrorKind::Context(ctx)));
+        other
+    }
+}
+
+impl<I> ErrorConvert<Error<I>> for Error<(I, usize)>
+where
+    I: Slice<RangeFrom<usize>>,
+{
+    fn convert(self) -> Error<I> {
+        let errors = self
+            .errors
+            .into_iter()
+            .map(|((rest, offset), err)| (rest.slice(offset / 8..), err))
+            .collect();
+
+        Error { errors }
+    }
+}
+
+/// We expect to recieve a buffer of bytes as our input to our parsers.
+pub type Input<'a> = &'a [u8];
+
+/// We want to be consistent with our parsing error type throughout this library.
+/// So, we define a custom result type that we should return everywhere.
+pub type Result<'a, O> = nom::IResult<Input<'a>, O, Error<Input<'a>>>;
+
+/// If we're expecting a buffer of bits, use this type for input.
+pub type BitInput<'a> = (&'a [u8], usize);
+
+/// If we're expecting a buffer of bits, use this type for output.
+pub type BitResult<'a, O> = nom::IResult<BitInput<'a>, O, Error<BitInput<'a>>>;

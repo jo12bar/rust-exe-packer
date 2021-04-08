@@ -23,17 +23,22 @@ fn main() -> anyhow::Result<()> {
 
     // ndisasm(&code_ph.data[..], file.entry_point)?;
 
-    println!("Dynamic entries:");
-    if let Some(ds) = file
-        .program_headers
-        .iter()
-        .find(|ph| ph.typ == delf::SegmentType::Dynamic)
-    {
-        if let delf::SegmentContents::Dynamic(ref table) = ds.contents {
-            for entry in table {
-                println!("\t- {:?}", entry);
+    if let Some(entries) = file.dynamic_table() {
+        println!("\nDynamic table entries:");
+        for e in entries {
+            println!("\t- {:?}", e);
+            match e.tag {
+                delf::DynamicTag::Needed | delf::DynamicTag::RPath | delf::DynamicTag::RunPath => {
+                    println!("\t    => {:?}", file.get_string(e.addr)?);
+                }
+                _ => {}
             }
         }
+    }
+
+    println!("\nSection headers:");
+    for sh in &file.section_headers {
+        println!("\t- {:?}", sh);
     }
 
     println!("\nRela entries:");
@@ -54,10 +59,45 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let syms = file.read_syms().context("Could not read symbols")?;
+    println!(
+        "\nSymbol table @ {:?} contains {} entries:",
+        file.dynamic_entry(delf::DynamicTag::SymTab).unwrap(),
+        syms.len()
+    );
+
+    println!(
+        "\tNum   Value       Size      Type            Bind            Ndx         Name        ",
+    );
+    for (num, s) in syms.iter().enumerate() {
+        println!(
+            "\t{:<6}{:12}{:<10}{:16}{:16}{:12}{:12}",
+            num,
+            format!("{:?}", s.value),
+            s.size,
+            format!("{:?}", s.typ),
+            format!("{:?}", s.bind),
+            format!("{:?}", s.shndx),
+            file.get_string(s.name).unwrap_or_default(),
+        )
+    }
+
+    // TODO: REMOVE ME LATER:
+
+    let msg = syms
+        .iter()
+        .find(|sym| file.get_string(sym.name).unwrap_or_default() == "msg")
+        .expect("Should find msg in symbol table");
+    let msg_slice = file.slice_at(msg.value).expect("Should find msg in memory");
+    let msg_slice = &msg_slice[..msg.size as usize];
+    println!("\nmsg contents: {:?}", String::from_utf8_lossy(msg_slice));
+
+    // /TODO
+
     // Picked by fair, 4KiB-aligned dice roll.
     let base = 0x400000_usize;
 
-    println!("Loading with base address @ 0x{:x}", base);
+    println!("\nLoading with base address @ 0x{:x}", base);
 
     // We're only interested in "Load" segments:
     let non_empty_code_segments = file
@@ -104,27 +144,31 @@ fn main() -> anyhow::Result<()> {
         let mut num_relocs = 0;
         for reloc in &rela_entries {
             if mem_range.contains(&reloc.offset) {
-                num_relocs += 1;
-
                 let real_segment_start = unsafe { addr.add(padding) };
                 let offset_into_segment = reloc.offset - mem_range.start;
                 let reloc_addr = unsafe { real_segment_start.add(offset_into_segment.into()) };
 
                 match reloc.typ {
-                    delf::RelType::Relative => {
-                        // This assumes `reloc_addr` is 8-byte aligned. If this
-                        // wasn't the case, we could crash, and so would the
-                        // target executable.
-                        let reloc_addr = reloc_addr as *mut u64;
-                        let reloc_value = reloc.addend + delf::Addr(base as u64);
-                        unsafe {
-                            *reloc_addr = reloc_value.0;
+                    delf::RelType::Known(t) => {
+                        num_relocs += 1;
+                        match t {
+                            delf::KnownRelType::Relative => {
+                                // This assumes `reloc_addr` is 8-byte aligned. If this
+                                // wasn't the case, we could crash, and so would the
+                                // target executable.
+                                let reloc_addr = reloc_addr as *mut u64;
+                                let reloc_value = reloc.addend + delf::Addr(base as u64);
+                                unsafe {
+                                    *reloc_addr = reloc_value.0;
+                                }
+                            }
+
+                            typ => {
+                                bail!("Unsupported known relocation type {:?}", typ);
+                            }
                         }
                     }
-
-                    typ => {
-                        bail!("Unsupported relocation type {:?}", typ);
-                    }
+                    delf::RelType::Unknown(_) => {}
                 }
             }
         }
