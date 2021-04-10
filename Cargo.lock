@@ -89,6 +89,7 @@ dependencies = [
  "anyhow",
  "custom_debug_derive",
  "delf",
+ "enumflags2",
  "mmap",
  "region",
  "thiserror",

@@ -5,5 +5,13 @@
     "errno.h": "c",
     "mman.h": "c"
   },
-  "rust-analyzer.procMacro.enable": true
+  "rust-analyzer.procMacro.enable": true,
+  "rust-analyzer.inlayHints.enable": true,
+  // Rust analyzer erraneously throws path resolution errors when dealing with
+  // things in std::os. So, since we use that module, disable the unresolved
+  // import experimental diagnostic. Rust analyzer will still show if cargo-check
+  // or clippy or rustc can't resolve modules - it's just that that will happen
+  // after saving files.
+  // See https://github.com/rust-analyzer/rust-analyzer/issues/6038#issuecomment-699670537
+  "rust-analyzer.diagnostics.disabled": ["unresolved-import"]
 }

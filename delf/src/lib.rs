@@ -792,6 +792,26 @@ impl Addr {
         use nom::{combinator::map, number::complete::le_u64};
         map(le_u64, From::from)(i)
     }
+
+    /// Convert into an actual pointer to a spot in memory.
+    ///
+    /// # Safety
+    /// This can create dangling pointers and all sorts of eldritch horrors.
+    pub unsafe fn as_ptr<T>(&self) -> *const T {
+        std::mem::transmute(self.0 as usize)
+    }
+
+    /// Convert into a *mutable* pointer to a spot in memory.
+    ///
+    /// # Safety
+    /// Mutable pointers are a wonderful way to create unspeakable mistakes.
+    /// Programs that will segfault, but only on random Thursdays. I hope you
+    /// enjoy gdb and nasm.
+    ///
+    /// Viewer discretion strongly advised.
+    pub unsafe fn as_mut_ptr<T>(&self) -> *mut T {
+        std::mem::transmute(self.0 as usize)
+    }
 }
 
 impl fmt::Debug for Addr {
