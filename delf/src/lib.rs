@@ -147,6 +147,13 @@ impl File {
         self.dynamic_entries(tag).next()
     }
 
+    /// Like [`File::dynamic_entry`], except it returns a `Result<_, GetDynamicEntryError>`
+    /// instead of just an `Option<_>`.
+    pub fn get_dynamic_entry(&self, tag: DynamicTag) -> Result<Addr, GetDynamicEntryError> {
+        self.dynamic_entry(tag)
+            .ok_or(GetDynamicEntryError::NotFound(tag))
+    }
+
     /// Returns an iterator over the strings associated with a dynamic entry.
     pub fn dynamic_entry_strings(&self, tag: DynamicTag) -> impl Iterator<Item = String> + '_ {
         // `Result::ok` transforms a `Result<T, E>` into an `Option<T>`
@@ -163,26 +170,23 @@ impl File {
         use DynamicTag as DT;
         use ReadRelaError as E;
 
-        // Converting `Option<T>` to `Result<T, E>` so we can use `?` to bubble
-        // up errors:
-        let addr = self.dynamic_entry(DT::Rela).ok_or(E::RelaNotFound)?;
-        let len = self.dynamic_entry(DT::RelaSz).ok_or(E::RelaSzNotFound)?;
-        let ent = self.dynamic_entry(DT::RelaEnt).ok_or(E::RelaEntNotFound)?;
+        match self.dynamic_entry(DT::Rela) {
+            None => Ok(vec![]),
+            Some(addr) => {
+                let len = self.get_dynamic_entry(DT::RelaSz)?;
 
-        // double-slicing trick:
-        let i = self.slice_at(addr).ok_or(E::RelaSegmentNotFound)?;
-        let i = &i[..len.into()];
-        let n = (len.0 / ent.0) as usize;
+                let i = self.slice_at(addr).ok_or(E::RelaSegmentNotFound)?;
+                let i = &i[..len.into()];
 
-        match many_m_n(n, n, Rela::parse)(i) {
-            Ok((_, rela_entries)) => Ok(rela_entries),
-            Err(nom::Err::Failure(err)) | Err(nom::Err::Error(err)) => {
-                let e = &err.errors[0];
-                let (_input, error_kind) = e;
-                Err(E::ParsingError(error_kind.clone()))
+                let n = len.0 as usize / Rela::SIZE;
+                match many_m_n(n, n, Rela::parse)(i) {
+                    Ok((_, rela_entries)) => Ok(rela_entries),
+                    Err(nom::Err::Failure(err)) | Err(nom::Err::Error(err)) => {
+                        Err(E::ParsingError(format!("{:?}", err)))
+                    }
+                    Err(nom::Err::Incomplete(_)) => unreachable!(),
+                }
             }
-            // we don't use any "streaming" parsers so `nom::Err::Incomplete` shouldn't happen
-            Err(nom::Err::Incomplete(..)) => unreachable!(),
         }
     }
 
@@ -223,7 +227,7 @@ impl File {
         use DynamicTag as DT;
         use ReadSymsError as E;
 
-        let addr = self.dynamic_entry(DT::SymTab).ok_or(E::SymTabNotFound)?;
+        let addr = self.get_dynamic_entry(DT::SymTab)?;
         let section = self
             .section_starting_at(addr)
             .ok_or(E::SymTabSectionNotFound)?;
@@ -234,9 +238,7 @@ impl File {
         match many_m_n(n, n, Sym::parse)(i) {
             Ok((_, syms)) => Ok(syms),
             Err(nom::Err::Failure(err)) | Err(nom::Err::Error(err)) => {
-                let e = &err.errors[0];
-                let (_input, error_kind) = e;
-                Err(E::ParsingError(error_kind.clone()))
+                Err(E::ParsingError(format!("{:?}", err)))
             }
             // we don't use any "streaming" parsers so `nom::Err::Incomplete` shouldn't happen
             Err(nom::Err::Incomplete(..)) => unreachable!(),
@@ -549,6 +551,8 @@ pub struct Rela {
 }
 
 impl Rela {
+    pub const SIZE: usize = 24;
+
     pub fn parse(i: parse::Input) -> parse::Result<Self> {
         use nom::{combinator::map, number::complete::le_u32, sequence::tuple};
 
@@ -584,7 +588,7 @@ impl Rela {
 ///   relocation entry.
 #[derive(Debug, TryFromPrimitive, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum KnownRelType {
+pub enum RelType {
     /// Calculation: none
     None = 0,
     /// Calculation: `S + A`
@@ -642,35 +646,17 @@ pub enum KnownRelType {
     IRelative = 37,
 }
 
-impl_parse_for_enum!(KnownRelType, le_u32);
-
-/// Either a known [`KnownRelType`] or an unknown `RelType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelType {
-    Known(KnownRelType),
-    Unknown(u32),
-}
-
-impl RelType {
-    pub fn parse(i: parse::Input) -> parse::Result<Self> {
-        use nom::{branch::alt, combinator::map, number::complete::le_u32};
-
-        alt((
-            map(KnownRelType::parse, Self::Known),
-            map(le_u32, Self::Unknown),
-        ))(i)
-    }
-}
+impl_parse_for_enum!(RelType, le_u32);
 
 /// An ELF symbol.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Sym {
     /// An offset into the dynamic string table giving the symbol's name.
     pub name: Addr,
     /// The symbol's binding attributes. A 4-bit value.
-    pub bind: Option<SymBind>,
+    pub bind: SymBind,
     /// The symbol's type. A 4-bit value.
-    pub typ: Option<SymType>,
+    pub typ: SymType,
     /// The section of the file in which the symbol is defined.
     pub shndx: SectionIndex,
     /// The address of the symbol. For defined symbols, this corresponds to the
@@ -723,12 +709,7 @@ pub enum SymBind {
     Weak = 2,
 }
 
-impl SymBind {
-    pub fn parse(i: parse::BitInput) -> parse::BitResult<Option<Self>> {
-        use nom::{bits::complete::take, combinator::map};
-        map(take(4_usize), |i: u8| Self::try_from(i).ok())(i)
-    }
-}
+impl_parse_for_bitenum!(SymBind, 4_usize);
 
 /// The possible symbol types. Each value is 4 bits.
 #[derive(Debug, TryFromPrimitive, Clone, Copy)]
@@ -740,12 +721,7 @@ pub enum SymType {
     Section = 3,
 }
 
-impl SymType {
-    pub fn parse(i: parse::BitInput) -> parse::BitResult<Option<Self>> {
-        use nom::{bits::complete::take, combinator::map};
-        map(take(4_usize), |i: u8| Self::try_from(i).ok())(i)
-    }
-}
+impl_parse_for_bitenum!(SymType, 4_usize);
 
 /// A section index, primarily used for ELF symbols.
 #[derive(Clone, Copy)]
@@ -812,11 +788,47 @@ impl Addr {
     pub unsafe fn as_mut_ptr<T>(&self) -> *mut T {
         std::mem::transmute(self.0 as usize)
     }
+
+    /// Convert to a slice over a spot in memory.
+    ///
+    /// # Safety
+    /// You're trying to access memory that Rust has minimal control over and/or
+    /// guarantees about. Bloody anarachist.
+    pub unsafe fn as_slice<T>(&self, len: usize) -> &[T] {
+        std::slice::from_raw_parts(self.as_ptr(), len)
+    }
+
+    /// Convert to a *mutable* slice over a spot in memory.
+    ///
+    /// # Safety
+    /// Ah, I see. Not only do you want to come into my house, take all my stuff,
+    /// *most* of which you don't even know what it is, and then change it?
+    /// Pscychopath.
+    pub unsafe fn as_mut_slice<T>(&mut self, len: usize) -> &mut [T] {
+        std::slice::from_raw_parts_mut(self.as_mut_ptr(), len)
+    }
+
+    /// Write a completely arbritrary set of bytes to a completely arbritrary
+    /// spot in memory. The source and destination must not overlap.
+    ///
+    /// # Safety
+    /// If it isn't obvious to you why this is unsafe, go suck on an egg.
+    pub unsafe fn write(&self, src: &[u8]) {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), self.as_mut_ptr(), src.len());
+    }
+
+    /// Write anything at all to any memory address.
+    ///
+    /// # Safety
+    /// <sub>mummy make the bad man go away pls</sub>
+    pub unsafe fn set<T>(&self, src: T) {
+        *self.as_mut_ptr() = src;
+    }
 }
 
 impl fmt::Debug for Addr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:08x}", self.0)
+        write!(f, "{:016x}", self.0)
     }
 }
 
@@ -900,18 +912,12 @@ impl std::error::Error for FileParseError {}
 /// Errors that may occur when reading an ELF `Rela`.
 #[derive(thiserror::Error, Debug)]
 pub enum ReadRelaError {
-    #[error("Rela dynamic entry not found")]
-    RelaNotFound,
-    #[error("RelaSz dynamic entry not found")]
-    RelaSzNotFound,
+    #[error("{0}")]
+    DynamicEntryNotFound(#[from] GetDynamicEntryError),
     #[error("Rela segment not found")]
     RelaSegmentNotFound,
-    #[error("RelaEnt dynamic entry not found")]
-    RelaEntNotFound,
-    #[error("RelaSeg dynamic entry not found")]
-    RelaSegNotFound,
     #[error("Parsing error")]
-    ParsingError(parse::ErrorKind),
+    ParsingError(String),
 }
 
 /// Errors that may occur when trying to access the global string table.
@@ -925,16 +931,24 @@ pub enum GetStringError {
     StringNotFound,
 }
 
+/// Errors that may occur when reading symbols.
 #[derive(thiserror::Error, Debug)]
 pub enum ReadSymsError {
-    #[error("SymTab dynamic entry not found")]
-    SymTabNotFound,
+    #[error("{0:?}")]
+    DynamicEntryNotFound(#[from] GetDynamicEntryError),
     #[error("SymTab section not found")]
     SymTabSectionNotFound,
     #[error("SymTab segment not found")]
     SymTabSegmentNotFound,
-    #[error("Parsing error")]
-    ParsingError(parse::ErrorKind),
+    #[error("Parsing error: {0}")]
+    ParsingError(String),
+}
+
+/// Errors that may occur when getting dynamic table entries.
+#[derive(thiserror::Error, Debug)]
+pub enum GetDynamicEntryError {
+    #[error("Dynamic entry {0:?} not found.")]
+    NotFound(DynamicTag),
 }
 
 #[cfg(test)]

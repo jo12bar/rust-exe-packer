@@ -29,7 +29,7 @@
           "kind": "bin"
         }
       },
-      "args": ["/bin/true"],
+      "args": ["./samples/bss2"],
       "cwd": "${workspaceFolder}"
     },
     {

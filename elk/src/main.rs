@@ -1,5 +1,6 @@
 //! # `elk` - Executable and Linker Kit
 
+mod name;
 mod process;
 
 use anyhow::Context;

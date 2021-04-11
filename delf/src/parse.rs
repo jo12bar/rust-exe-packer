@@ -1,7 +1,7 @@
 //! Utilities for parsing little-endian, 64-bit ELF files via [`nom`].
 
 use nom::{ErrorConvert, Slice};
-use std::ops::RangeFrom;
+use std::{fmt, ops::RangeFrom};
 
 /// Implements a parse method for an enum, allowing you to parse some number
 /// value into an enum type.
@@ -31,18 +31,17 @@ macro_rules! impl_parse_for_enum {
                     stringify!($number_parser),
                     "`].",
                 ),
-                pub fn parse(i: $crate::parse::Input) -> $crate::parse::Result<Self> {
-                    use nom::{
-                        combinator::map_res,
-                        error::{context, ErrorKind},
-                        number::complete::$number_parser,
-                    };
+                pub fn parse(full_input: $crate::parse::Input) -> $crate::parse::Result<Self> {
+                    use nom::number::complete::$number_parser;
 
-                    let parser = map_res($number_parser, |x| {
-                        Self::try_from(x).map_err(|_| ErrorKind::Alt)
-                    });
-
-                    context(stringify!($type), parser)(i)
+                    let (i, val) = $number_parser(full_input)?;
+                    match Self::try_from(val) {
+                        Ok(val) => Ok((i, val)),
+                        Err(_) => Err(nom::Err::Failure($crate::parse::Error::from_string(
+                            full_input,
+                            format!("Unknown {} {} (0x{:x})", stringify!($type), val, val),
+                        ))),
+                    }
                 }
             }
         }
@@ -81,16 +80,54 @@ macro_rules! impl_parse_for_enumflags {
     }
 }
 
+#[macro_export]
+macro_rules! impl_parse_for_bitenum {
+    ($type: ident, $bits: expr) => {
+        impl $type {
+            pub fn parse(full_input: $crate::parse::BitInput) -> $crate::parse::BitResult<Self> {
+                use nom::bits::complete::take;
+
+                let (i, val): (_, u8) = take($bits)(full_input)?;
+                match Self::try_from(val) {
+                    Ok(val) => Ok((i, val)),
+                    Err(_) => Err(nom::Err::Failure($crate::parse::Error::from_string(
+                        full_input,
+                        format!("Unknown {} {} (0x{:x})", stringify!($type), val, val),
+                    ))),
+                }
+            }
+        }
+    };
+}
+
 /// The type of parsing error.
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
     Nom(nom::error::ErrorKind),
     Context(&'static str),
+    String(String),
+}
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Nom(n) => fmt::Display::fmt(n.description(), f),
+            Self::Context(c) => fmt::Display::fmt(c, f),
+            Self::String(s) => fmt::Display::fmt(s, f),
+        }
+    }
 }
 
 /// A parsing error.
 pub struct Error<I> {
     pub errors: Vec<(I, ErrorKind)>,
+}
+
+impl<I> Error<I> {
+    pub fn from_string<S: Into<String>>(input: I, s: S) -> Self {
+        let errors = vec![(input, ErrorKind::String(s.into()))];
+        Self { errors }
+    }
 }
 
 impl<I> nom::error::ParseError<I> for Error<I> {
@@ -122,6 +159,28 @@ where
             .collect();
 
         Error { errors }
+    }
+}
+
+impl fmt::Debug for Error<&[u8]> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (input, err) in &self.errors {
+            writeln!(f, "{:?}:", err)?;
+            writeln!(f, "\t└──> input: {:?}", crate::HexDump(input))?;
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for Error<&[u8]> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (input, err) in &self.errors {
+            writeln!(f, "{}:", err)?;
+            writeln!(f, "\t└──> input: {:?}", crate::HexDump(input))?;
+        }
+
+        Ok(())
     }
 }
 

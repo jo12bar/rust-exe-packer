@@ -1,3 +1,9 @@
+samples/bss.o
+samples/bss
+samples/bss2.o
+samples/bss2
+samples/bss3.o
+samples/bss3
 samples/entry_point
 samples/hello.o
 samples/hello
