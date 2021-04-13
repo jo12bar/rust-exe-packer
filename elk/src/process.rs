@@ -57,8 +57,8 @@ impl Process {
             .map_err(|e| LoadError::Io(path.clone(), e))?;
 
         println!("Loading {:?}", path);
-        let file = delf::File::parse(&input[..])
-            .map_err(|fpe| LoadError::ParseError(path.clone(), fpe))?;
+        let file =
+            delf::File::parse(input).map_err(|fpe| LoadError::ParseError(path.clone(), fpe))?;
 
         let origin = path
             .parent()
@@ -69,6 +69,7 @@ impl Process {
         self.search_path.extend(
             file.dynamic_entry_strings(delf::DynamicTag::RPath)
                 .chain(file.dynamic_entry_strings(delf::DynamicTag::RunPath))
+                .map(|path| String::from_utf8_lossy(path))
                 .map(|path| path.replace("$ORIGIN", &origin))
                 .inspect(|path| println!("\t- RPath entry found: {:?}", path))
                 .map(PathBuf::from),
@@ -121,8 +122,11 @@ impl Process {
                     // The mapping only geos up to filesz...
                     filesz.into(),
                     &[
+                        // Set up temporary permissions for mapping and relocations.
+                        // Permissions get correctly-set later.
                         MapOption::MapReadable,
                         MapOption::MapWritable,
+                        MapOption::MapExecutable,
                         MapOption::MapFd(fs_file.as_raw_fd()),
                         MapOption::MapOffset(offset.into()),
                         MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
@@ -154,29 +158,33 @@ impl Process {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let syms = file.read_syms().map_err(LoadError::from)?;
+        let syms = file.read_dynsym_entries().map_err(LoadError::from)?;
 
-        let strtab = file
-            .get_dynamic_entry(delf::DynamicTag::StrTab)
-            .with_context(|| format!("String table not found in {:?}", path))?;
+        let syms: Vec<_> = if syms.is_empty() {
+            vec![]
+        } else {
+            let strtab = file
+                .get_dynamic_entry(delf::DynamicTag::StrTab)
+                .with_context(|| format!("String table not found in {:?}", path))?;
 
-        let syms = syms
-            .into_iter()
-            .map(|sym| -> anyhow::Result<_> {
-                unsafe {
-                    let name = Name::from_addr(base + strtab + sym.name)?;
-                    Ok(NamedSym { sym, name })
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .context("Could not read symbol during load")?;
+            syms.into_iter()
+                .map(|sym| -> anyhow::Result<_> {
+                    unsafe {
+                        let name = Name::from_addr(base + strtab + sym.name)?;
+                        Ok(NamedSym { sym, name })
+                    }
+                })
+                .collect::<Result<_, _>>()
+                .context("Could not read symbol during load")?
+        };
 
         let mut sym_map = MultiMap::new();
         for sym in &syms {
             sym_map.insert(sym.name.clone(), sym.clone());
         }
 
-        let rels = file.read_rela_entries().map_err(LoadError::from)?;
+        let mut rels = file.read_rela_entries().map_err(LoadError::from)?;
+        rels.extend(file.read_jmp_rel_entries().map_err(LoadError::from)?);
 
         let obj = Object {
             path: path.clone(),
@@ -211,6 +219,7 @@ impl Process {
                 .into_iter()
                 .map(|index| &self.objects[index].file)
                 .flat_map(|file| file.dynamic_entry_strings(delf::DynamicTag::Needed))
+                .map(|s| String::from_utf8_lossy(s).to_string()) // FIXME: hacky
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|dep| self.get_object(&dep))
@@ -259,78 +268,6 @@ impl Process {
         }
 
         Ok(())
-
-        // use delf::RelType as RT;
-
-        // for obj in self.objects.iter().rev() {
-        //     println!("Applying relocations for {:?}", obj.path);
-
-        //     match obj.file.read_rela_entries() {
-        //         Ok(rels) => {
-        //             for rel in rels {
-        //                 println!("\t- Found {:?}", rel);
-        //                 let reltype = rel.typ;
-
-        //                 match rel.typ {
-        //                     RT::_64 => {
-        //                         let name = obj.sym_name(rel.sym)?;
-        //                         println!("\t  ├──> Looking up {:?}", name);
-
-        //                         let (lib, sym) = self
-        //                             .lookup_symbol(&name, None)?
-        //                             .ok_or(RelocationError::UndefinedSymbol(name))?;
-
-        //                         println!("\t  ├──> Found at {:?} in {:?}", sym.value, lib.path);
-
-        //                         let offset = obj.base + rel.offset;
-        //                         let value = sym.value + lib.base + rel.addend;
-        //                         println!("\t  ├──> Value: {:?}", value);
-
-        //                         unsafe {
-        //                             let ptr: *mut u64 = offset.as_mut_ptr();
-        //                             println!("\t  └──> Applying reloc @ {:?}", ptr);
-        //                             *ptr = value.0;
-        //                         }
-        //                     }
-
-        //                     RT::Copy => {
-        //                         let name = obj.sym_name(rel.sym)?;
-        //                         let (lib, sym) =
-        //                             self.lookup_symbol(&name, Some(obj))?.ok_or_else(|| {
-        //                                 RelocationError::UndefinedSymbol(name.clone())
-        //                             })?;
-
-        //                         println!(
-        //                             "\t  ├──> Found {:?} at {:?} (size {:?}) in {:?}",
-        //                             name, sym.value, sym.size, lib.path
-        //                         );
-
-        //                         unsafe {
-        //                             let src = (sym.value + lib.base).as_ptr();
-        //                             let dst = (rel.offset + obj.base).as_mut_ptr();
-
-        //                             println!(
-        //                                 "\t  └──> Copying {} bytes from {:?} to {:?}",
-        //                                 sym.size, src, dst
-        //                             );
-        //                             std::ptr::copy_nonoverlapping::<u8>(
-        //                                 src,
-        //                                 dst,
-        //                                 sym.size as usize,
-        //                             );
-        //                         }
-        //                     }
-
-        //                     _ => return Err(RelocationError::UnimplementedRelocation(reltype)),
-        //                 }
-        //             }
-        //         }
-
-        //         Err(e) => println!("\t- Nevermind: {:?}", e),
-        //     }
-        // }
-
-        // Ok(())
     }
 
     /// Apply a single relocation.
@@ -384,6 +321,15 @@ impl Process {
 
             RT::Relative => unsafe {
                 objrel.addr().set(obj.base + addend);
+            },
+
+            RT::IRelative => unsafe {
+                // Call the indirect selector at loadtime, *before* performing
+                // the relocation and jumping to the entry point.
+                // This is hella unsafe.
+                let selector: extern "C" fn() -> delf::Addr =
+                    std::mem::transmute(obj.base + addend);
+                objrel.addr().set(selector());
             },
 
             _ => return Err(RelocationError::UnimplementedRelocation(reltype)),
@@ -460,7 +406,7 @@ pub struct Object {
     /// The ELF file associated with this object.
     /// Skipped in debug output because it can get *really* verbose.
     #[debug(skip)]
-    pub file: delf::File,
+    pub file: delf::File<Vec<u8>>,
 
     /// The path this ELF object was loaded from.
     pub path: PathBuf,
