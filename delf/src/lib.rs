@@ -904,8 +904,8 @@ impl Addr {
     ///
     /// # Safety
     /// This can create dangling pointers and all sorts of eldritch horrors.
-    pub unsafe fn as_ptr<T>(&self) -> *const T {
-        std::mem::transmute(self.0 as usize)
+    pub fn as_ptr<T>(&self) -> *const T {
+        self.0 as *const T
     }
 
     /// Convert into a *mutable* pointer to a spot in memory.
@@ -916,8 +916,8 @@ impl Addr {
     /// enjoy gdb and nasm.
     ///
     /// Viewer discretion strongly advised.
-    pub unsafe fn as_mut_ptr<T>(&self) -> *mut T {
-        std::mem::transmute(self.0 as usize)
+    pub fn as_mut_ptr<T>(&self) -> *mut T {
+        self.0 as *mut T
     }
 
     /// Convert to a slice over a spot in memory.

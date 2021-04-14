@@ -13,6 +13,7 @@ use std::{
     ops::Range,
     os::unix::io::AsRawFd,
     path::{Path, PathBuf},
+    sync::Arc,
     usize,
 };
 
@@ -129,7 +130,7 @@ impl Process {
                         MapOption::MapExecutable,
                         MapOption::MapFd(fs_file.as_raw_fd()),
                         MapOption::MapOffset(offset.into()),
-                        MapOption::MapAddr(unsafe { (base + vaddr).as_ptr() }),
+                        MapOption::MapAddr((base + vaddr).as_ptr()),
                     ],
                 )?;
 
@@ -151,7 +152,8 @@ impl Process {
                 }
 
                 Ok(Segment {
-                    map,
+                    map: Arc::new(map),
+                    vaddr_range: vaddr..(ph.vaddr + ph.memsz),
                     padding,
                     flags: ph.flags,
                 })
@@ -163,16 +165,26 @@ impl Process {
         let syms: Vec<_> = if syms.is_empty() {
             vec![]
         } else {
-            let strtab = file
+            let dynstr = file
                 .get_dynamic_entry(delf::DynamicTag::StrTab)
-                .with_context(|| format!("String table not found in {:?}", path))?;
+                .with_context(|| format!("String table not found in {:?}", path.clone()))?;
+
+            // FInd the right `MemoryMap` to refer to.
+            let segment = segments
+                .iter()
+                .find(|seg| seg.vaddr_range.contains(&dynstr))
+                .with_context(|| {
+                    format!("Segment not found for string table in {:?}", path.clone())
+                })?;
 
             syms.into_iter()
                 .map(|sym| -> anyhow::Result<_> {
-                    unsafe {
-                        let name = Name::from_addr(base + strtab + sym.name)?;
-                        Ok(NamedSym { sym, name })
-                    }
+                    let name = Name::mapped(
+                        &segment.map,
+                        (dynstr + sym.name - segment.vaddr_range.start).into(),
+                    )
+                    .context("Could not find name for symbol")?;
+                    Ok(NamedSym { sym, name })
                 })
                 .collect::<Result<_, _>>()
                 .context("Could not read symbol during load")?
@@ -302,7 +314,7 @@ impl Process {
                     delf::SymBind::Weak => undef,
 
                     // Otherwise, error out now.
-                    _ => return Err(RelocationError::UndefinedSymbol(format!("{:?}", wanted))),
+                    _ => return Err(RelocationError::UndefinedSymbol(wanted.sym.clone().into())),
                 },
 
                 // Defined symbols are always fine.
@@ -327,8 +339,8 @@ impl Process {
                 // Call the indirect selector at loadtime, *before* performing
                 // the relocation and jumping to the entry point.
                 // This is hella unsafe.
-                let selector: extern "C" fn() -> delf::Addr =
-                    std::mem::transmute(obj.base + addend);
+                type Selector = unsafe extern "C" fn() -> delf::Addr;
+                let selector: Selector = std::mem::transmute(obj.base + addend);
                 objrel.addr().set(selector());
             },
 
@@ -437,7 +449,8 @@ pub struct Object {
 #[derive(CustomDebug)]
 pub struct Segment {
     #[debug(skip)]
-    pub map: MemoryMap,
+    pub map: Arc<MemoryMap>,
+    pub vaddr_range: Range<delf::Addr>,
     pub padding: delf::Addr,
     pub flags: BitFlags<delf::SegmentFlag>,
 }
@@ -447,6 +460,23 @@ pub struct Segment {
 pub struct NamedSym {
     sym: delf::Sym,
     name: Name,
+}
+
+/// A named ELF symbol where `name` has already been run through [`std::fmt::Debug::fmt`].
+/// This is useful for getting a `Send + Sync` version of [`NamedSym`].
+#[derive(Debug, Clone)]
+pub struct PreformattedDebugNamedSym {
+    sym: delf::Sym,
+    name: String,
+}
+
+impl From<NamedSym> for PreformattedDebugNamedSym {
+    fn from(val: NamedSym) -> Self {
+        Self {
+            sym: val.sym,
+            name: format!("{:?}", val.name),
+        }
+    }
 }
 
 /// Pretty much just teis together an object and a symbol.
@@ -533,6 +563,6 @@ pub enum RelocationError {
     UnimplementedRelocation(delf::RelType),
     #[error("Unknown symbol number: {0}")]
     UnknownSymbolNumber(u32),
-    #[error("Undefined symbol: {0}")]
-    UndefinedSymbol(String),
+    #[error("Undefined symbol: {0:?}")]
+    UndefinedSymbol(PreformattedDebugNamedSym),
 }

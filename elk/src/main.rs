@@ -93,8 +93,17 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let exe_obj = &proc.objects[exe_index];
     let entry_point = exe_obj.file.entry_point + exe_obj.base;
     unsafe { jmp(entry_point.as_ptr()) };
+}
 
-    Ok(())
+/// Jump to some random memory address
+///
+/// # Safety
+/// Look, this should be obvious, but you're in for some real crazy shit if
+/// if you're trying to jump to random instructions in memory.
+unsafe fn jmp(addr: *const u8) -> ! {
+    type EntryPoint = unsafe extern "C" fn() -> !;
+    let entry_point: EntryPoint = std::mem::transmute(addr);
+    entry_point();
 }
 
 fn cmd_autosym(args: AutosymArgs) -> anyhow::Result<()> {
@@ -227,16 +236,6 @@ fn cmd_dig(args: DigArgs) -> anyhow::Result<()> {
 
         Ok(())
     })
-}
-
-/// Jump to some random memory address
-///
-/// # Safety
-/// Look, this should be obvious, but you're in for some real crazy shit if
-/// if you're trying to jump to random instructions in memory.
-unsafe fn jmp(addr: *const u8) {
-    let fn_ptr: fn() = std::mem::transmute(addr);
-    fn_ptr();
 }
 
 /// Allows formatting a [`delf::Addr`] as a size in bytes.

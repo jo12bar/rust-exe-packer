@@ -1,44 +1,62 @@
 use anyhow::Context;
+use mmap::MemoryMap;
 use std::{
     fmt,
     hash::{Hash, Hasher},
+    ops::Range,
+    sync::Arc,
 };
+
+/// Adds a method to [`mmap::MemoryMap`] that lets us work with slices instead of
+/// pointers.
+trait MemoryMapExt {
+    fn as_slice(&self) -> &[u8];
+}
+
+impl MemoryMapExt for MemoryMap {
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data(), self.len()) }
+    }
+}
 
 /// Known names for symbols in the ELF file.
 #[derive(Clone)]
 pub enum Name {
     /// For names that come stright from an ELF file mapped in memory.
-    FromAddr { addr: delf::Addr, len: usize },
+    Mapped {
+        map: Arc<MemoryMap>,
+        range: Range<usize>,
+    },
     /// For names that we own. For example, maybe we want to look up a specific
     /// symbol from a Rust string literal - this will be useful for that.
     Owned(Vec<u8>),
 }
 
 impl Name {
-    /// Get a name from a null-terminated string somewhere in memory.
-    ///
-    /// For "safety" (to avoid segfaults), name size is limited to 2048 bytes.
-    /// Hopefully the *actual* limit for ELF symbol size is way lower, so we won't
-    /// ever run into that.
-    ///
-    /// # Safety
-    ///
-    /// `addr` must point to a null-terminated string. Otherwise, you'll have an
-    /// UB party with a bunch of depressed clowns.
-    pub unsafe fn from_addr(addr: delf::Addr) -> anyhow::Result<Self> {
-        let len = addr
-            .as_slice::<u8>(2048)
+    /// Get a name from an offset somewhere in a memory map.
+    pub fn mapped(map: &Arc<MemoryMap>, offset: usize) -> anyhow::Result<Self> {
+        let len = map
+            .as_slice()
             .iter()
+            .skip(offset)
             .position(|&c| c == 0)
-            .context("Scanned 2048 bytes without finding a null-terminator for a name")?;
+            .context("Scanned 2048 bytes without finding null-terminator for name.")?;
 
-        Ok(Self::FromAddr { addr, len })
+        Ok(Self::Mapped {
+            map: map.clone(),
+            range: offset..offset + len,
+        })
+    }
+
+    /// Construct an owned name.
+    pub fn owned<T: Into<Vec<u8>>>(value: T) -> Self {
+        Self::Owned(value.into())
     }
 
     /// Get the name as a slice into memory.
     pub fn as_slice(&self) -> &[u8] {
         match self {
-            Self::FromAddr { addr, len } => unsafe { addr.as_slice(*len) },
+            Self::Mapped { map, range } => &map.as_slice()[range.clone()],
             Self::Owned(vec) => &vec[..],
         }
     }
@@ -46,11 +64,13 @@ impl Name {
 
 impl fmt::Debug for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Ok(s) = std::str::from_utf8(self.as_slice()) {
+        let s = self.as_slice();
+
+        if let Ok(s) = std::str::from_utf8(s) {
             // This only succeeds if the name is valid utf-8:
             fmt::Display::fmt(s, f)
         } else {
-            fmt::Debug::fmt(self.as_slice(), f)
+            fmt::Debug::fmt(s, f)
         }
     }
 }
