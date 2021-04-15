@@ -2,5 +2,7 @@
 
 members = [
     "delf",
-    "elk"
+    "elk",
 ]
+
+exclude = ["samples"]

@@ -1,11 +1,14 @@
 //! # `elk` - Executable and Linker Kit
 
+#![feature(asm)]
+
 mod name;
 mod process;
 mod procfs;
 
 use anyhow::{bail, Context};
 use argh::FromArgs;
+use std::ffi::CString;
 
 #[derive(FromArgs, PartialEq, Debug)]
 /// Top-level command
@@ -36,7 +39,12 @@ struct AutosymArgs {
 /// Load and run an ELF executable
 struct RunArgs {
     #[argh(positional)]
+    /// the absolute path of an executable file to load and run
     exec_path: String,
+
+    #[argh(positional)]
+    /// arguments for the executable file
+    args: Vec<String>,
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -86,24 +94,40 @@ where
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let mut proc = process::Process::new();
-    let exe_index = proc.load_object_and_dependencies(args.exec_path)?;
+    let exe_index = proc.load_object_and_dependencies(&args.exec_path)?;
     proc.apply_relocations()?;
     proc.adjust_protections()?;
 
-    let exe_obj = &proc.objects[exe_index];
-    let entry_point = exe_obj.file.entry_point + exe_obj.base;
-    unsafe { jmp(entry_point.as_ptr()) };
-}
+    let exec = &proc.objects[exe_index];
 
-/// Jump to some random memory address
-///
-/// # Safety
-/// Look, this should be obvious, but you're in for some real crazy shit if
-/// if you're trying to jump to random instructions in memory.
-unsafe fn jmp(addr: *const u8) -> ! {
-    type EntryPoint = unsafe extern "C" fn() -> !;
-    let entry_point: EntryPoint = std::mem::transmute(addr);
-    entry_point();
+    // the first argument is typically the path to the executable itself.
+    // that's not something `argh` gives us, so let's add it ourselves:
+    let args = std::iter::once(CString::new(args.exec_path.as_bytes()).unwrap())
+        .chain(
+            args.args
+                .iter()
+                .map(|s| CString::new(s.as_bytes()).unwrap()),
+        )
+        .collect();
+
+    let opts = process::StartOptions {
+        exec,
+        args,
+        // on the stack, environment variables are null-terminated `K=V` strings.
+        // the Rust API gives us key-value pairs, so we need to build those strings
+        // ourselves
+        env: std::env::vars()
+            .map(|(k, v)| CString::new(format!("{}={}", k, v).as_bytes()).unwrap())
+            .collect(),
+        // right now we pass all *our* auxiliary vectors to the underlying process.
+        // note that some of those aren't quite correct - there's a `Base` auxiliary
+        // vector, for example, which is set to `elk`'s base address, not `echidna`'s!
+        auxv: process::Auxv::get_known(),
+    };
+
+    proc.start(&opts);
+
+    Ok(())
 }
 
 fn cmd_autosym(args: AutosymArgs) -> anyhow::Result<()> {

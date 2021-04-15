@@ -589,6 +589,7 @@ pub enum SectionType {
     GnuVerdef = 0x6ffffffd,
     GnuVerneed = 0x6ffffffe,
     GnuVersym = 0x6fffffff,
+    X8664Unwind = 0x70000001,
 }
 
 impl_parse_for_enum!(SectionType, le_u32);

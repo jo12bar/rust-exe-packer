@@ -9,6 +9,7 @@ use multimap::MultiMap;
 use std::{
     cmp::{max, min},
     collections::HashMap,
+    ffi::CString,
     io::Read,
     ops::Range,
     os::unix::io::AsRawFd,
@@ -20,6 +21,46 @@ use std::{
 /// Computes the minimal range that contains two ranges.
 fn convex_hull<T: std::cmp::Ord>(a: Range<T>, b: Range<T>) -> Range<T> {
     (min(a.start, b.start))..(max(a.end, b.end))
+}
+
+/// Jump to some random memory address
+///
+/// # Safety
+/// Look, this should be obvious, but you're in for some real crazy shit if
+/// if you're trying to jump to random instructions in memory.
+#[inline(never)]
+unsafe fn jmp(entry_point: *const u8, stack_contents: *const u64, qword_count: usize) {
+    asm!(
+        // allocate (qword_count * 8) bytes
+        "mov {tmp}, {qword_count}",
+        "sal {tmp}, 3",
+        "sub rsp, {tmp}",
+
+        ".l1:",
+        // start at i = (n-1)
+        "sub {qword_count}, 1",
+        // copy qwords to the stack
+        "mov {tmp}, QWORD PTR [{stack_contents}+{qword_count}*8]",
+        "mov QWORD PTR [rsp+{qword_count}*8], {tmp}",
+        // loop if i isn't zero, break otherwise
+        "test {qword_count}, {qword_count}",
+        "jnz .l1",
+
+        "jmp {entry_point}",
+
+        entry_point = in(reg) entry_point,
+        stack_contents = in(reg) stack_contents,
+        qword_count = in(reg) qword_count,
+        tmp = out(reg) _,
+    )
+}
+
+/// Startup options to pass to a child process.
+pub struct StartOptions<'a> {
+    pub exec: &'a Object,
+    pub args: Vec<CString>,
+    pub env: Vec<CString>,
+    pub auxv: Vec<Auxv>,
 }
 
 /// A sub-process, executed in memory.
@@ -34,6 +75,15 @@ pub struct Process {
 }
 
 impl Process {
+    /// Start a process!
+    pub fn start(&self, opts: &StartOptions) {
+        let exec = opts.exec;
+        let entry_point = exec.file.entry_point + exec.base;
+        let stack = Self::build_stack(opts);
+
+        unsafe { jmp(entry_point.as_ptr(), stack.as_ptr(), stack.len()) };
+    }
+
     /// Create a new process graph.
     pub fn new() -> Self {
         Self {
@@ -401,6 +451,50 @@ impl Process {
 
         Ok(())
     }
+
+    fn build_stack(opts: &StartOptions) -> Vec<u64> {
+        let mut stack = Vec::new();
+
+        let null = 0_u64;
+
+        macro_rules! push {
+            ($x:expr) => {
+                stack.push($x as u64)
+            };
+        }
+
+        // NOTE: everything is pushed in reverse order
+
+        // argc
+        push!(opts.args.len());
+
+        // argv
+        for v in &opts.args {
+            push!(v.as_ptr());
+        }
+        push!(null);
+
+        // envp
+        for v in &opts.env {
+            push!(v.as_ptr());
+        }
+        push!(null);
+
+        // auxv
+        for v in &opts.auxv {
+            push!(v.typ);
+            push!(v.value);
+        }
+        push!(AuxType::Null);
+        push!(null);
+
+        // Align stack to 16-byte boundary:
+        if stack.len() % 2 == 1 {
+            push!(0);
+        }
+
+        stack
+    }
 }
 
 /// The result of running [`Process::get_object`].
@@ -541,6 +635,120 @@ impl ObjectRel<'_> {
     /// base address.
     fn addr(&self) -> delf::Addr {
         self.obj.base + self.rel.offset
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u64)]
+#[allow(dead_code)]
+pub enum AuxType {
+    /// End of vector
+    Null = 0,
+    /// Entry should be ignored
+    Ignore = 1,
+    /// File descriptor of program
+    ExecFd = 2,
+    /// Program headers for program
+    PHdr = 3,
+    /// Size of program header entry
+    PhEnt = 4,
+    /// Number of program headers
+    PhNum = 5,
+    /// System page size
+    PageSz = 6,
+    /// Base address of interpreter
+    Base = 7,
+    /// Flags
+    Flags = 8,
+    /// Entry point of program
+    Entry = 9,
+    /// Program is not ELF
+    NotElf = 10,
+    /// Real uid
+    Uid = 11,
+    /// Effective uid
+    EUid = 12,
+    /// Real gid
+    Gid = 13,
+    /// Effective gid
+    EGid = 14,
+    /// String identifying CPU for optimizations
+    Platform = 15,
+    /// Arch-dependent hints at CPU capabilities
+    HwCap = 16,
+    /// Frequency at which times() increments
+    ClkTck = 17,
+    /// Secure mode boolean
+    Secure = 23,
+    /// String identifying real platform, may differ from Platform
+    BasePlatform = 24,
+    /// Address of 16 random bytes
+    Random = 25,
+    // Extension of HwCap
+    HwCap2 = 26,
+    /// Filename of program
+    ExecFn = 31,
+
+    SysInfo = 32,
+    SysInfoEHdr = 33,
+}
+
+/// Represents an auxiliary vector.
+pub struct Auxv {
+    typ: AuxType,
+    value: u64,
+}
+
+impl Auxv {
+    /// A list of all the auxiliary types we know (and care) about
+    const KNOWN_TYPES: &'static [AuxType] = &[
+        AuxType::ExecFd,
+        AuxType::PHdr,
+        AuxType::PhEnt,
+        AuxType::PhNum,
+        AuxType::PageSz,
+        AuxType::Base,
+        AuxType::Flags,
+        AuxType::Entry,
+        AuxType::NotElf,
+        AuxType::Uid,
+        AuxType::EUid,
+        AuxType::Gid,
+        AuxType::EGid,
+        AuxType::Platform,
+        AuxType::HwCap,
+        AuxType::ClkTck,
+        AuxType::Secure,
+        AuxType::BasePlatform,
+        AuxType::Random,
+        AuxType::HwCap2,
+        AuxType::ExecFn,
+        AuxType::SysInfo,
+        AuxType::SysInfoEHdr,
+    ];
+
+    /// Get an auxiliary vector value with the help of libc.
+    pub fn get(typ: AuxType) -> Option<Self> {
+        extern "C" {
+            /// From libc
+            fn getauxval(typ: u64) -> u64;
+        }
+
+        unsafe {
+            match getauxval(typ as u64) {
+                0 => None,
+                value => Some(Self { typ, value }),
+            }
+        }
+    }
+
+    /// Returns a list of all aux vectors passed to us _that we know about_.
+    pub fn get_known() -> Vec<Self> {
+        Self::KNOWN_TYPES
+            .iter()
+            .copied()
+            .filter_map(Self::get)
+            .collect()
     }
 }
 
