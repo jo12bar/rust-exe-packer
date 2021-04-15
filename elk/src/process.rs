@@ -344,7 +344,16 @@ impl Process {
                 objrel.addr().set(selector());
             },
 
-            _ => return Err(RelocationError::UnimplementedRelocation(reltype)),
+            RT::GlobDat | RT::JumpSlot => unsafe {
+                objrel.addr().set(found.value());
+            },
+
+            _ => {
+                return Err(RelocationError::UnimplementedRelocation(
+                    obj.path.clone(),
+                    reltype,
+                ))
+            }
         }
 
         Ok(())
@@ -559,8 +568,8 @@ pub enum LoadError {
 /// Errors that may occur when performing memory relocations on an ELF object.
 #[derive(thiserror::Error, Debug)]
 pub enum RelocationError {
-    #[error("Unimplemented relocation: {0:?}")]
-    UnimplementedRelocation(delf::RelType),
+    #[error("{0:?}: Unimplemented relocation: {1:?}")]
+    UnimplementedRelocation(PathBuf, delf::RelType),
     #[error("Unknown symbol number: {0}")]
     UnknownSymbolNumber(u32),
     #[error("Undefined symbol: {0:?}")]
