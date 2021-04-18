@@ -850,6 +850,7 @@ pub enum SymType {
     Func = 2,
     Section = 3,
     File = 4,
+    TLS = 6,
     IFunc = 10,
 }
 
@@ -892,7 +893,7 @@ impl fmt::Debug for SectionIndex {
 /// Wraps a `u64` memory address, and adds some nice, automatic `Display` and
 /// `Debug` formats. Also adds a nice method for parsing `u64` memory addresses
 /// from a buffer of `u8`'s using `nom`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Add, Sub)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Add, Sub, Hash)]
 pub struct Addr(pub u64);
 
 impl Addr {

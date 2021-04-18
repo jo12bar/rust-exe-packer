@@ -94,11 +94,12 @@ where
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let mut proc = process::Process::new();
-    let exe_index = proc.load_object_and_dependencies(&args.exec_path)?;
-    proc.apply_relocations()?;
-    proc.adjust_protections()?;
+    let exec_index = proc.load_object_and_dependencies(&args.exec_path)?;
 
-    let exec = &proc.objects[exe_index];
+    let proc = proc.allocate_tls();
+    let proc = proc.apply_relocations()?;
+    let proc = proc.initialize_tls();
+    let proc = proc.adjust_protections()?;
 
     // the first argument is typically the path to the executable itself.
     // that's not something `argh` gives us, so let's add it ourselves:
@@ -111,7 +112,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         .collect();
 
     let opts = process::StartOptions {
-        exec,
+        exec_index,
         args,
         // on the stack, environment variables are null-terminated `K=V` strings.
         // the Rust API gives us key-value pairs, so we need to build those strings
@@ -126,8 +127,6 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     };
 
     proc.start(&opts);
-
-    Ok(())
 }
 
 fn cmd_autosym(args: AutosymArgs) -> anyhow::Result<()> {

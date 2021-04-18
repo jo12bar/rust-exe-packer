@@ -8,3 +8,6 @@ edition = "2018"
 
 [dependencies]
 compiler_builtins = { version = "0.1.40", features = ["mem"] }
+
+[profile.release]
+debug = true

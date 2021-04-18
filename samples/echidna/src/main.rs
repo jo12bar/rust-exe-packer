@@ -3,6 +3,7 @@
 #![feature(asm)]
 #![feature(naked_functions)]
 #![feature(const_generics)]
+#![feature(thread_local)]
 #![allow(incomplete_features)]
 #![no_main]
 
@@ -17,8 +18,31 @@ unsafe extern "C" fn _start() {
     asm!("mov rdi, rsp", "call main", options(noreturn))
 }
 
+#[thread_local]
+static mut FOO: u32 = 10;
+
+#[thread_local]
+static mut BAR: u32 = 100;
+
+#[inline(never)]
+fn blackbox(x: u32) {
+    println!(x as usize);
+}
+
+#[inline(never)]
+#[no_mangle]
+unsafe fn play_with_tls() {
+    blackbox(FOO);
+    blackbox(BAR);
+    FOO *= 3;
+    BAR *= 6;
+    blackbox(FOO);
+    blackbox(BAR);
+}
+
 #[no_mangle]
 unsafe fn main(stack_top: *const u8) {
+    play_with_tls();
     let argc = *(stack_top as *const u64);
     let argv = stack_top.add(8) as *const *const u8;
 
