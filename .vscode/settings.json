@@ -9,5 +9,5 @@
   // See https://github.com/rust-analyzer/rust-analyzer/issues/6038#issuecomment-699670537
   "rust-analyzer.diagnostics.disabled": ["unresolved-import"],
 
-  "rust-analyzer.files.excludeDirs": ["${workspaceFolder}/samples/echidna"]
+  "rust-analyzer.files.excludeDirs": ["${workspaceFolder}/elk/samples/echidna"]
 }

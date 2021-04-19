@@ -1,8 +1,0 @@
-[workspace]
-
-members = [
-    "delf",
-    "elk",
-]
-
-exclude = ["samples"]

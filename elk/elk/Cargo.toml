@@ -1,0 +1,19 @@
+[package]
+name = "elk"
+version = "0.1.0"
+authors = ["Johann Barnard <johann.b@telus.net>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.40"
+custom_debug_derive = "0.5.0"
+delf = { path = "../delf" }
+mmap = "0.1.1"
+region = "2"
+thiserror = "1"
+enumflags2 = "0.6"
+multimap = "0.8.3"
+argh = "0.1.4"
+nom = "5"
