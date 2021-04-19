@@ -96,6 +96,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let mut proc = process::Process::new();
     let exec_index = proc.load_object_and_dependencies(&args.exec_path)?;
 
+    proc.patch_libc();
     let proc = proc.allocate_tls();
     let proc = proc.apply_relocations()?;
     let proc = proc.initialize_tls();

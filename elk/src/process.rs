@@ -84,6 +84,18 @@ unsafe fn set_fs(addr: u64) {
     )
 }
 
+/// Call an ELF initializer function.
+///
+/// # Safety
+/// You must be a creationist.
+#[inline(never)]
+unsafe fn call_init(addr: delf::Addr, argc: i32, argv: *const *const i8, envp: *const *const i8) {
+    let init: extern "C" fn(argc: i32, argv: *const *const i8, envp: *const *const i8) =
+        std::mem::transmute(addr.0);
+
+    init(argc, argv, envp);
+}
+
 /// Defines something as being a possible state for a [`Process`]. No matter
 /// what state, the process is in, it always has a [`Loader`], which includes
 /// several common fields that the process basically always has.
@@ -200,6 +212,17 @@ impl<S: ProcessState> Process<S> {
         }
 
         ResolvedSym::Undefined
+    }
+
+    /// Get all object initializers in the order in which they should be called.
+    fn initializers(&self) -> Vec<(&Object, delf::Addr)> {
+        let mut res = Vec::new();
+
+        for obj in self.state.loader().objects.iter().rev() {
+            res.extend(obj.initializers.iter().map(|&init| (obj, init)));
+        }
+
+        res
     }
 }
 
@@ -398,6 +421,25 @@ impl Process<Loading> {
         let mut rels = file.read_rela_entries().map_err(LoadError::from)?;
         rels.extend(file.read_jmp_rel_entries().map_err(LoadError::from)?);
 
+        // Get all the initializers for the object.
+        let mut initializers = Vec::new();
+        if let Some(init) = file.dynamic_entry(delf::DynamicTag::Init) {
+            // We store all initializer addresses "already rebased".
+            let init = init + base;
+            initializers.push(init);
+        }
+
+        // Get some initializers hiding in `DYNAMIC`:
+        if let Some(init_array) = file.dynamic_entry(delf::DynamicTag::InitArray) {
+            if let Some(init_array_sz) = file.dynamic_entry(delf::DynamicTag::InitArraySz) {
+                let init_array = base + init_array;
+                let n = init_array_sz.0 as usize / std::mem::size_of::<delf::Addr>();
+
+                let inits: &[delf::Addr] = unsafe { init_array.as_slice(n) };
+                initializers.extend(inits.iter().map(|&init| init + base));
+            }
+        }
+
         let obj = Object {
             path: path.clone(),
             base,
@@ -407,6 +449,7 @@ impl Process<Loading> {
             syms,
             sym_map,
             rels,
+            initializers,
         };
 
         let idx = self.state.loader.objects.len();
@@ -442,6 +485,64 @@ impl Process<Loading> {
         }
 
         Ok(index)
+    }
+
+    /// Make your momma sad and patch various functions from libc with hacky
+    /// stubs to avoid completely reimplementing libc in rust.
+    pub fn patch_libc(&self) {
+        let mut stub_map = std::collections::HashMap::<&str, Vec<u8>>::new();
+
+        // Add a fake implementation for _dl_addr that always returns 0.
+        stub_map.insert(
+            "_dl_addr",
+            vec![
+                0x48, 0x31, 0xc0, // xor rax, rax
+                0xc3, // ret
+            ],
+        );
+
+        stub_map.insert(
+            "exit",
+            vec![
+                0x48, 0x31, 0xff, // xor rdi, rdi
+                0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60
+                0x0f, 0x05, // syscall
+            ],
+        );
+
+        let pattern = "/libc-2.";
+        let libc = match self
+            .state
+            .loader
+            .objects
+            .iter()
+            .find(|&obj| obj.path.to_string_lossy().contains(pattern))
+        {
+            Some(x) => x,
+            None => {
+                println!("Warning: could not find libc to patch!");
+                return;
+            }
+        };
+
+        for (name, instructions) in stub_map {
+            let name = Name::owned(name);
+            let sym = match libc.sym_map.get(&name) {
+                Some(sym) => ObjectSym { obj: libc, sym },
+                None => {
+                    println!(
+                        "Warning: Could not find symbol {:?} in {:?}",
+                        name, libc.path
+                    );
+                    continue;
+                }
+            };
+
+            println!("Patching libc function {:?} ({:?})", sym.value(), name);
+            unsafe {
+                sym.value().write(&instructions);
+            }
+        }
     }
 
     /// Allocate thread-local storage. This must be done once loading is complete.
@@ -515,7 +616,7 @@ impl Process<Loading> {
 impl Process<TLSAllocated> {
     /// Apply memory relocations to all loaded objects.
     pub fn apply_relocations(self) -> anyhow::Result<Process<Relocated>, RelocationError> {
-        let rels = self
+        let mut rels: Vec<_> = self
             .state
             .loader
             .objects
@@ -523,10 +624,19 @@ impl Process<TLSAllocated> {
             .rev()
             .map(|obj| obj.rels.iter().map(move |rel| ObjectRel { obj, rel }))
             .flatten()
-            .collect::<Vec<_>>();
+            .collect();
 
-        for rel in rels {
-            self.apply_relocation(rel)?
+        // First direct, then indirect.
+        for &group in &[RelocGroup::Direct, RelocGroup::Indirect] {
+            println!("Applying {:?} relocations ({} left)", group, rels.len());
+            rels = rels
+                .into_iter()
+                //      passing which group we're relocating 👇
+                .map(|objrel| self.apply_relocation(objrel, group))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
         }
 
         Ok(Process {
@@ -538,7 +648,11 @@ impl Process<TLSAllocated> {
     }
 
     /// Apply a single relocation.
-    fn apply_relocation(&self, objrel: ObjectRel) -> anyhow::Result<(), RelocationError> {
+    fn apply_relocation<'a>(
+        &self,
+        objrel: ObjectRel<'a>,
+        group: RelocGroup,
+    ) -> anyhow::Result<Option<ObjectRel<'a>>, RelocationError> {
         use delf::RelType as RT;
 
         // Destructure a bit, for convenience:
@@ -553,14 +667,15 @@ impl Process<TLSAllocated> {
             sym: &obj.syms[rel.sym as usize],
         };
 
-        // When doing a lookup, only ifnore the relocation's object if we're
+        // When doing a lookup, only ignore the relocation's object if we're
         // performing a Copy relocation.
         let ignore_self = matches!(reltype, RT::Copy);
 
         // Perform symbol lookup early:
         let found = match rel.sym {
-            // The relocation isn't bound to any symbol - go with undef:
-            0 => ResolvedSym::Undefined,
+            // This relocation isn't bound to any symbol - return the zeroeth
+            // symbol of the object in quesiton.
+            0 => obj.symzero(),
 
             // The relocation is actually bound to a symbol! Look it up.
             _ => match self.lookup_symbol(&wanted, ignore_self) {
@@ -577,6 +692,14 @@ impl Process<TLSAllocated> {
             },
         };
 
+        // Perform direct relocations first, and return:
+        if let RelocGroup::Direct = group {
+            if reltype == RT::IRelative || found.is_indirect() {
+                return Ok(Some(objrel)); // deferred
+            }
+        }
+
+        // Perform other relocations second:
         match reltype {
             RT::_64 => unsafe {
                 objrel.addr().set(found.value() + addend);
@@ -623,6 +746,10 @@ impl Process<TLSAllocated> {
                 }
             },
 
+            RT::DtpMod64 => unsafe {
+                objrel.addr().set(1); // FIXME: This is probably wrong. Might have to move to Arch Linux.
+            },
+
             _ => {
                 return Err(RelocationError::UnimplementedRelocation(
                     obj.path.clone(),
@@ -631,7 +758,7 @@ impl Process<TLSAllocated> {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -702,10 +829,26 @@ impl Process<Protected> {
     pub fn start(self, opts: &StartOptions) -> ! {
         let exec = &self.state.loader.objects[opts.exec_index];
         let entry_point = exec.file.entry_point + exec.base;
+
         let stack = Self::build_stack(opts);
+        let initializers = self.initializers();
+
+        let argc = opts.args.len() as i32;
+
+        let mut argv: Vec<_> = opts.args.iter().map(|x| x.as_ptr()).collect();
+        argv.push(std::ptr::null());
+
+        let mut envp: Vec<_> = opts.env.iter().map(|x| x.as_ptr()).collect();
+        envp.push(std::ptr::null());
 
         unsafe {
             set_fs(self.state.tls.tcb_addr.0);
+
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..initializers.len() {
+                call_init(initializers[i].1, argc, argv.as_ptr(), envp.as_ptr());
+            }
+
             jmp(entry_point.as_ptr(), stack.as_ptr(), stack.len())
         };
     }
@@ -756,16 +899,6 @@ impl Process<Protected> {
     }
 }
 
-/*impl Process {
-
-
-
-
-
-
-
-}*/
-
 /// The result of running [`Process::get_object`].
 pub enum GetResult {
     Cached(usize),
@@ -815,6 +948,21 @@ pub struct Object {
     /// Relocations associated with this object
     #[debug(skip)]
     pub rels: Vec<delf::Rela>,
+
+    /// Initializers for a shared object. Note that all initializer addresses
+    /// are stored "already rebased".
+    #[debug(skip)]
+    pub initializers: Vec<delf::Addr>,
+}
+
+impl Object {
+    /// Resolves and returns the zeroeth symbol of this ELF object.
+    fn symzero(&self) -> ResolvedSym {
+        ResolvedSym::Defined(ObjectSym {
+            obj: &self,
+            sym: &self.syms[0],
+        })
+    }
 }
 
 /// A memory segment.
@@ -861,7 +1009,14 @@ pub struct ObjectSym<'a> {
 impl ObjectSym<'_> {
     /// Returns the re-based address of the object/symbol combo.
     fn value(&self) -> delf::Addr {
-        self.obj.base + self.sym.sym.value
+        let addr = self.obj.base + self.sym.sym.value;
+        match self.sym.sym.typ {
+            delf::SymType::IFunc => unsafe {
+                let src: extern "C" fn() -> delf::Addr = std::mem::transmute(addr);
+                src()
+            },
+            _ => addr,
+        }
     }
 }
 
@@ -889,6 +1044,14 @@ impl ResolvedSym<'_> {
             Self::Undefined => 0,
         }
     }
+
+    /// True if this is an indirect, defined symbol, and false otherwise.
+    fn is_indirect(&self) -> bool {
+        match self {
+            Self::Undefined => false,
+            Self::Defined(sym) => matches!(sym.sym.sym.typ, delf::SymType::IFunc),
+        }
+    }
 }
 
 /// Groups an object and its relocation so that its easier to get the address
@@ -905,6 +1068,14 @@ impl ObjectRel<'_> {
     fn addr(&self) -> delf::Addr {
         self.obj.base + self.rel.offset
     }
+}
+
+/// Our two possible "relocation groups" - direct relocations, and indirect
+/// relocations.
+#[derive(Clone, Copy, Debug)]
+pub enum RelocGroup {
+    Direct,
+    Indirect,
 }
 
 #[derive(Debug, Clone, Copy)]
