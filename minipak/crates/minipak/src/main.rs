@@ -7,7 +7,13 @@
 #![feature(asm)]
 #![feature(link_args)]
 
+mod cli;
+
 use encore::prelude::*;
+use pixie::{EndMarker, Manifest, PixieError, Resource, Writer};
+
+/// Typical size of pages (and thus, segment alignment)
+const PAGE_SIZE: u64 = 4 * 1024;
 
 /// Don't link any glibc stuff, and make this executable static.
 #[allow(unused_attributes)]
@@ -22,26 +28,63 @@ unsafe extern "C" fn _start() {
 }
 
 #[no_mangle]
-unsafe fn pre_main(_stack_top: *mut u8) {
+unsafe fn pre_main(stack_top: *mut u8) {
     init_allocator();
-    main().unwrap();
+    main(Env::read(stack_top)).unwrap();
     syscall::exit(0);
 }
 
-fn main() -> Result<(), EncoreError> {
-    let file = File::open("/etc/lsb-release")?;
-    let map = file.map()?;
+#[allow(clippy::unnecessary_wraps)]
+fn main(env: Env) -> Result<(), PixieError> {
+    let args = cli::Args::parse(&env);
 
-    let s = core::str::from_utf8(&map[..]).unwrap();
-    for l in s.lines() {
-        println!("> {}", l);
+    let mut output = Writer::new(&args.output, 0o755)?;
+
+    {
+        let stage1 = include_bytes!(concat!(env!("OUT_DIR"), "/embeds/stage1"));
+        output.write_all(stage1)?;
     }
 
-    let an_executable = File::open("/lib64/ld-linux-x86-64.so.2")?;
-    let exe_map = an_executable.map()?;
+    let guest_offset = output.offset();
+    let guest_compressed_len;
+    let guest_len;
 
-    let there_you_go = core::str::from_utf8(&exe_map[1..4]).unwrap();
-    println!("\n{}", there_you_go);
+    {
+        let guest = File::open(&args.input)?;
+        let guest = guest.map()?;
+        let guest = guest.as_ref();
+        guest_len = guest.len();
+
+        let guest_compressed = lz4_flex::compress_prepend_size(guest);
+        guest_compressed_len = guest_compressed.len();
+        output.write_all(&guest_compressed[..])?;
+    }
+
+    output.align(PAGE_SIZE)?;
+    let manifest_offset = output.offset();
+
+    {
+        let manifest = Manifest {
+            guest: Resource {
+                offset: guest_offset as _,
+                len: guest_compressed_len as _,
+            },
+        };
+        output.write_deku(&manifest)?;
+    }
+
+    {
+        let marker = EndMarker {
+            manifest_offset: manifest_offset as _,
+        };
+        output.write_deku(&marker)?;
+    }
+
+    println!(
+        "Wrote {} ({:.2}% of input)",
+        args.output,
+        output.offset() as f64 / guest_len as f64 * 100.0,
+    );
 
     Ok(())
 }

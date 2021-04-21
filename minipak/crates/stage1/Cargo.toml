@@ -1,5 +1,5 @@
 [package]
-name = "minipak"
+name = "stage1"
 version = "0.1.0"
 authors = ["Johann Barnard <johann.b@telus.net>"]
 edition = "2018"

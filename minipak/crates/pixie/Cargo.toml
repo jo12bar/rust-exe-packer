@@ -1,5 +1,5 @@
 [package]
-name = "encore"
+name = "pixie"
 version = "0.1.0"
 authors = ["Johann Barnard <johann.b@telus.net>"]
 edition = "2018"
@@ -7,8 +7,6 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bitflags = "1.2.1"
-compiler_builtins = { version = "0.1.40", features = ["mangled-names"] }
+deku = { version = "0.11.0", default-features = false, features = ["alloc"] }
+encore = { path = "../encore"}
 displaydoc = { version = "0.2.1", default-features = false }
-linked_list_allocator = "0.8.11"
-rlibc = "1.0.0"
