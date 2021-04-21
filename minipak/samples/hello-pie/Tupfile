@@ -1,0 +1,3 @@
+CFLAGS += -static-pie
+
+: hello-pie.c |> gcc $(CFLAGS) %f -o %o |> %B

@@ -8,7 +8,7 @@ fn main() {
 }
 
 fn cargo_build(path: &Path) {
-    println!("cargo:rerun-if-changed={}", path.display());
+    println!("cargo:rerun-if-changed=..");
 
     let target_dir = format!("{}/embeds", std::env::var("OUT_DIR").unwrap());
 

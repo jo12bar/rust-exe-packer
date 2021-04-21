@@ -214,3 +214,20 @@ pub unsafe fn close(fd: FileDescriptor) -> u64 {
 
     rax
 }
+
+/// Duplicate a file descriptor with the `dup` syscall.
+///
+/// # Safety
+/// Calls into the kernel.
+#[inline(always)]
+pub unsafe fn dup(fd: u64) {
+    let syscall_number = 32;
+
+    asm!(
+        "syscall",
+        in("rax") syscall_number,
+        in("rdi") fd,
+        lateout("rcx") _, lateout("r11") _,
+        options(nostack),
+    );
+}
