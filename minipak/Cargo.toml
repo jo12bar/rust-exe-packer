@@ -3,6 +3,7 @@ members = [
     "crates/encore",
     "crates/minipak",
     "crates/stage1",
+    "crates/stage2",
     "crates/pixie",
 ]
 
@@ -12,4 +13,7 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 debug = true
-lto = "thin"
+codegen-units = 1
+incremental = false
+lto = "fat"
+opt-level = "s"

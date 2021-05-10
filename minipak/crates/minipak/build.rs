@@ -3,8 +3,15 @@ use std::{
     process::Command,
 };
 
+const RUSTC_LINK_ARGS: &[&str] = &["-nostartfiles", "-nodefaultlibs", "-static"];
+
 fn main() {
+    for arg in RUSTC_LINK_ARGS {
+        println!("cargo:rustc-link-arg={}", arg);
+    }
+
     cargo_build(&PathBuf::from("../stage1"));
+    cargo_build(&PathBuf::from("../stage2"));
 }
 
 fn cargo_build(path: &Path) {
@@ -32,12 +39,12 @@ fn cargo_build(path: &Path) {
         );
     }
 
-    // Let's just assume the binary has the same name as the crate.
-    let binary_name = path.file_name().unwrap().to_str().unwrap();
+    // Let's just assume the library has the same name as the crate.
+    let lib_name = format!("lib{}.so", path.file_name().unwrap().to_str().unwrap());
     let output = Command::new("objcopy")
         .arg("--strip-all")
-        .arg(&format!("release/{}", binary_name))
-        .arg(binary_name)
+        .arg(&format!("release/{}", lib_name))
+        .arg(lib_name)
         .current_dir(&target_dir)
         .spawn()
         .unwrap()

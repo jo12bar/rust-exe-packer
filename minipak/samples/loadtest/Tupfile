@@ -1,0 +1,4 @@
+CFLAGS += -g
+LDFLAGS += -ldl
+
+: loadtest.c |> gcc $(CFLAGS) %f -o %o $(LDFLAGS) |> %B

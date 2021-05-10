@@ -7,7 +7,7 @@ use deku::prelude::*;
 #[derive(Debug, DekuRead, DekuWrite)]
 #[deku(magic = b"piximani")]
 pub struct Manifest {
-    // TODO: Add `stage2` resource.
+    pub stage2: Resource,
     pub guest: Resource,
 }
 

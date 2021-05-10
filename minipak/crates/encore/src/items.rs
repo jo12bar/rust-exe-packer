@@ -33,7 +33,7 @@ unsafe extern "C" fn bcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// Heap size, in megabytes
-const HEAP_SIZE_MB: u64 = 128;
+const HEAP_SIZE_MB: u64 = 512;
 
 /// Initialize a global allocator that only uses `mmap`, with a fixed heap size.
 ///
